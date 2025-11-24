@@ -8,6 +8,7 @@ import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
   getAssociatedTokenAddressSync,
   getOrCreateAssociatedTokenAccount,
+  transfer,
 } from "@solana/spl-token";
 import dotenv from "dotenv";
 import bs58 from "bs58";
@@ -74,6 +75,10 @@ const getProofForIndex = (idx: number) =>
 const claimAllocation = claimAllocations[0];
 const claimProof = getProofForIndex(0);
 
+// Claim window timestamps: November 22, 2025 9:00 UTC - November 24, 2025 9:00 UTC
+const CLAIM_OPEN_AT = Math.floor(new Date("2025-11-22T09:00:00Z").getTime() / 1000);
+const CLAIM_CLOSE_AT = Math.floor(new Date("2025-11-24T09:00:00Z").getTime() / 1000);
+
 describe("airdrop program", () => {
   it("initializes state and vault accounts", async () => {
     const adminAtaInfo = await provider.connection.getAccountInfo(adminTokenAccount);
@@ -86,10 +91,9 @@ describe("airdrop program", () => {
     const stateAccountInfo = await provider.connection.getAccountInfo(statePda);
     if (!stateAccountInfo) {
       const zeroRoot = Buffer.alloc(32);
-      // Set claim window: open immediately, close in 1 year
-      const currentTime = Math.floor(Date.now() / 1000);
-      const claimOpenAt = new anchor.BN(currentTime);
-      const claimCloseAt = new anchor.BN(currentTime + 365 * 24 * 60 * 60); // 1 year from now
+      // Set claim window: November 22, 2025 9:00 UTC - November 24, 2025 9:00 UTC
+      const claimOpenAt = new anchor.BN(CLAIM_OPEN_AT);
+      const claimCloseAt = new anchor.BN(CLAIM_CLOSE_AT);
       
       try {
         const sig = await program.methods
@@ -133,9 +137,9 @@ describe("airdrop program", () => {
     }
 
     const zeroRoot = Buffer.alloc(32);
-    const currentTime = Math.floor(Date.now() / 1000);
-    const claimOpenAt = new anchor.BN(currentTime);
-    const claimCloseAt = new anchor.BN(currentTime + 365 * 24 * 60 * 60);
+    // Set claim window: November 22, 2025 9:00 UTC - November 24, 2025 9:00 UTC
+    const claimOpenAt = new anchor.BN(CLAIM_OPEN_AT);
+    const claimCloseAt = new anchor.BN(CLAIM_CLOSE_AT);
 
     let reinitializationRejected = false;
     try {
@@ -189,7 +193,7 @@ describe("airdrop program", () => {
     }
   });
 
-  it("funds the vault with SPL tokens", async () => {
+  it("funds the vault with SPL tokens (admin can fund)", async () => {
     const deposit = claimAllocation.amount + 100_000_000n;
     const adminBalanceBefore = await provider.connection.getTokenAccountBalance(adminTokenAccount);
     expect(BigInt(adminBalanceBefore.value.amount) > deposit).to.be.true;
@@ -201,8 +205,8 @@ describe("airdrop program", () => {
         .fundVault(new anchor.BN(deposit.toString()))
         .accounts({
           state: statePda,
-          admin: adminPublicKey,
-          adminTokenAccount,
+          funder: adminPublicKey,
+          funderTokenAccount: adminTokenAccount,
           vaultAuthority,
           vault: vaultAta,
           tokenProgram: TOKEN_PROGRAM_ID,
@@ -223,6 +227,97 @@ describe("airdrop program", () => {
       );
     } catch (error) {
       console.error("vault balance comparison failed:", error);
+      throw error;
+    }
+  });
+
+  it("allows anyone with tokens to fund the vault", async () => {
+    // Create a random funder (non-admin)
+    const randomFunder = Keypair.generate();
+    
+    // Airdrop SOL to the random funder for transaction fees
+    const airdropSig = await provider.connection.requestAirdrop(
+      randomFunder.publicKey,
+      1 * anchor.web3.LAMPORTS_PER_SOL
+    );
+    await provider.connection.confirmTransaction(airdropSig);
+
+    // Create token account for the random funder
+    const funderTokenAccount = await getOrCreateAssociatedTokenAccount(
+      provider.connection,
+      randomFunder,
+      mintPubkey,
+      randomFunder.publicKey
+    );
+
+    // Transfer some tokens from admin to the random funder so they can fund
+    // First check if admin has enough tokens
+    const adminBalance = await provider.connection.getTokenAccountBalance(adminTokenAccount);
+    const testDepositAmount = 1_000_000n; // Small test amount
+    
+    if (BigInt(adminBalance.value.amount) < testDepositAmount) {
+      console.log("Skipping test: admin doesn't have enough tokens to transfer to funder");
+      return;
+    }
+
+    // Transfer tokens from admin to random funder using SPL token transfer
+    try {
+      await transfer(
+        provider.connection,
+        adminKeypair, // payer (for fees)
+        adminTokenAccount, // source
+        funderTokenAccount.address, // destination
+        adminKeypair, // owner (signer)
+        Number(testDepositAmount) // amount
+      );
+    } catch (error) {
+      console.error("Failed to transfer tokens to funder:", error);
+      throw error;
+    }
+    
+    const vaultBefore = await provider.connection.getTokenAccountBalance(vaultAta);
+    const funderBalanceBefore = await provider.connection.getTokenAccountBalance(funderTokenAccount.address);
+
+    // Verify funder received tokens
+    expect(BigInt(funderBalanceBefore.value.amount)).to.equal(testDepositAmount);
+
+    const depositAmount = BigInt(funderBalanceBefore.value.amount) / 2n; // Use half of funder's balance
+    const depositBN = new anchor.BN(depositAmount.toString());
+
+    try {
+      const sig = await program.methods
+        .fundVault(depositBN)
+        .accounts({
+          state: statePda,
+          funder: randomFunder.publicKey,
+          funderTokenAccount: funderTokenAccount.address,
+          vaultAuthority,
+          vault: vaultAta,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        })
+        .signers([randomFunder])
+        .rpc();
+      console.log("fund_vault (non-admin) tx:", sig);
+    } catch (error) {
+      console.error("fund_vault (non-admin) failed:", error);
+      throw error;
+    }
+
+    const vaultAfter = await provider.connection.getTokenAccountBalance(vaultAta);
+    const funderBalanceAfter = await provider.connection.getTokenAccountBalance(funderTokenAccount.address);
+    
+    try {
+      // Verify vault received the tokens
+      expect(BigInt(vaultAfter.value.amount)).to.equal(
+        BigInt(vaultBefore.value.amount) + depositAmount
+      );
+      // Verify funder's balance decreased
+      expect(BigInt(funderBalanceAfter.value.amount)).to.equal(
+        BigInt(funderBalanceBefore.value.amount) - depositAmount
+      );
+    } catch (error) {
+      console.error("vault/funder balance comparison failed:", error);
       throw error;
     }
   });

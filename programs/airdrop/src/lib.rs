@@ -5,7 +5,7 @@ use anchor_spl::{
     token::{self, Mint, Token, TokenAccount},
 };
 
-declare_id!("DwaC5fxw2UQCxRPcgjb9spXmiZY4LmAt9bxGS9o5MXmE");
+declare_id!("3wHwFvL48XHSHX1K81tdjti4ju15PGDjZt2kAmPruymw");
 
 #[program]
 pub mod airdrop {
@@ -52,13 +52,26 @@ pub mod airdrop {
         Ok(())
     }
 
+    pub fn update_claim_close_at(ctx: Context<UpdateClaimCloseAt>, new_claim_close_at: i64) -> Result<()> {
+        require!(new_claim_close_at > 0, AirdropError::InvalidTimestamp);
+        
+        let state = &mut ctx.accounts.state;
+        require!(
+            new_claim_close_at > state.claim_open_at,
+            AirdropError::InvalidTimestamp
+        );
+        
+        state.claim_close_at = new_claim_close_at;
+        Ok(())
+    }
+
     pub fn fund_vault(ctx: Context<FundVault>, amount: u64) -> Result<()> {
         require!(amount > 0, AirdropError::InvalidAmount);
 
         let transfer_accounts = token::Transfer {
-            from: ctx.accounts.admin_token_account.to_account_info(),
+            from: ctx.accounts.funder_token_account.to_account_info(),
             to: ctx.accounts.vault.to_account_info(),
-            authority: ctx.accounts.admin.to_account_info(),
+            authority: ctx.accounts.funder.to_account_info(),
         };
         let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), transfer_accounts);
         token::transfer(cpi_ctx, amount)?;
@@ -88,7 +101,7 @@ pub mod airdrop {
                 current_timestamp <= state.claim_close_at,
                 AirdropError::ClaimClosed
             );
-
+            require!(index < state.max_claims, AirdropError::IndexOutOfBounds);
             ensure_not_claimed(state, index)?;
 
             let leaf = leaf_hash(index, &ctx.accounts.claimer.key(), amount);
@@ -160,12 +173,14 @@ pub mod airdrop {
 #[derive(Accounts)]
 #[instruction(max_claims: u32, claim_open_at: i64, claim_close_at: i64)]
 pub struct Initialize<'info> {
+    /// CHECK: Admin address (does not need to sign)
+    pub admin: UncheckedAccount<'info>,
     #[account(mut)]
-    pub admin: Signer<'info>,
+    pub payer: Signer<'info>,
     pub mint: Account<'info, Mint>,
     #[account(
         init,
-        payer = admin,
+        payer = payer,
         seeds = [b"airdrop_state"],
         bump,
         space = AirdropState::space(max_claims)
@@ -179,7 +194,7 @@ pub struct Initialize<'info> {
     pub vault_authority: UncheckedAccount<'info>,
     #[account(
         init,
-        payer = admin,
+        payer = payer,
         associated_token::mint = mint,
         associated_token::authority = vault_authority
     )]
@@ -205,7 +220,7 @@ pub struct PostMerkleRoot<'info> {
 }
 
 #[derive(Accounts)]
-pub struct FundVault<'info> {
+pub struct UpdateClaimCloseAt<'info> {
     #[account(
         mut,
         seeds = [b"airdrop_state"],
@@ -216,12 +231,24 @@ pub struct FundVault<'info> {
         constraint = admin.key() == state.admin @ AirdropError::Unauthorized
     )]
     pub admin: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct FundVault<'info> {
     #[account(
         mut,
-        constraint = admin_token_account.owner == admin.key(),
-        constraint = admin_token_account.mint == state.mint
+        seeds = [b"airdrop_state"],
+        bump
     )]
-    pub admin_token_account: Account<'info, TokenAccount>,
+    pub state: Account<'info, AirdropState>,
+    #[account(mut)]
+    pub funder: Signer<'info>,
+    #[account(
+        mut,
+        constraint = funder_token_account.owner == funder.key(),
+        constraint = funder_token_account.mint == state.mint @ AirdropError::InvalidMint
+    )]
+    pub funder_token_account: Account<'info, TokenAccount>,
     /// CHECK: PDA authority for vault operations
     #[account(
         seeds = [b"airdrop_vault_authority"],
